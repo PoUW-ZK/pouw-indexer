@@ -1,0 +1,46 @@
+name: Docker image
+
+# Publishes an image to GitHub Container Registry: ghcr.io/pouw-zk/<repository>
+# main  -> tagy :main a :sha-xxxxxxx
+# v1.2.3 -> tagy :v1.2.3 a :latest
+# As long as there is no Dockerfile in the repository, the workflow will simply display a message.
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  image:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Detect Dockerfile
+        id: detect
+        run: |
+          if [ -f Dockerfile ]; then
+            echo "found=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::notice::There is no Dockerfile yet, so there is nothing to publish."
+          fi
+
+      - name: Build and push
+        if: steps.detect.outputs.found == 'true'
+        env:
+          TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          image="ghcr.io/${GITHUB_REPOSITORY,,}"
+          echo "$TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+          tags=(-t "$image:sha-${GITHUB_SHA::7}")
+          if [ "$GITHUB_REF" = "refs/heads/main" ]; then tags+=(-t "$image:main"); fi
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then tags+=(-t "$image:$GITHUB_REF_NAME" -t "$image:latest"); fi
+          docker build \
+            --label "org.opencontainers.image.source=https://github.com/$GITHUB_REPOSITORY" \
+            "${tags[@]}" .
+          docker push --all-tags "$image"
