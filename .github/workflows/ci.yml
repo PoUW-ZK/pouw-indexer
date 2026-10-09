@@ -43,7 +43,7 @@ jobs:
             echo "::notice::Projekt zatiaľ neexistuje, kontroly sa preskočia."
           fi
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         if: steps.detect.outputs.python == 'true'
         with:
           python-version: "3.12"
@@ -71,7 +71,7 @@ jobs:
           pip install pip-audit
           pip-audit --skip-editable
 
-      - uses: actions/setup-dotnet@v4
+      - uses: actions/setup-dotnet@v6
         if: steps.detect.outputs.dotnet == 'true'
         with:
           dotnet-version: 8.0.x
