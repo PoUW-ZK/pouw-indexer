@@ -1,0 +1,17 @@
+{
+  "circ:34e81634e20dae5860782ee2f3ef55b714e631bcca9b3822aecf17621c9a5ea9": {
+    "system": "groth16",
+    "constraint_count": 85000,
+    "registered_at_height": 1
+  },
+  "circ:3d07f0846feecbfbf1ef6fb6c27679331de20ac86ab8ab3dc0e003625671d279": {
+    "system": "plonk_kzg",
+    "constraint_count": 60000,
+    "registered_at_height": 1
+  },
+  "circ:a0ce967abc10e878d5076a2139595d4dd09b0d3ad7be78ab53de90b158ac4903": {
+    "system": "marlin",
+    "constraint_count": 25000,
+    "registered_at_height": 1
+  }
+}

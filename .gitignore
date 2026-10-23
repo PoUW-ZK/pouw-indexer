@@ -459,3 +459,8 @@ appsettings.Development.json
 .idea/
 .vscode/
 *.swp
+
+
+# Added by cargo
+
+/target

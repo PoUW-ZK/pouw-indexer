@@ -1,0 +1,180 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://pouw-zk.github.io/pouw-docs/contracts/node-events.schema.json",
+  "title": "Event",
+  "type": "object",
+  "required": ["seq", "time", "node_id", "kind", "data"],
+  "properties": {
+    "seq": { "type": "integer", "minimum": 1 },
+    "time": { "type": "string", "format": "date-time" },
+    "node_id": { "type": "string", "minLength": 1 }
+  },
+  "oneOf": [
+    { "properties": { "kind": { "const": "tx_received" }, "data": { "$ref": "#/$defs/tx_received" } } },
+    { "properties": { "kind": { "const": "tx_rejected" }, "data": { "$ref": "#/$defs/tx_rejected" } } },
+    { "properties": { "kind": { "const": "proof_request_started" }, "data": { "$ref": "#/$defs/proof_request_started" } } },
+    { "properties": { "kind": { "const": "proof_produced" }, "data": { "$ref": "#/$defs/proof_produced" } } },
+    { "properties": { "kind": { "const": "lottery_result" }, "data": { "$ref": "#/$defs/lottery_result" } } },
+    { "properties": { "kind": { "const": "block_received" }, "data": { "$ref": "#/$defs/block_received" } } },
+    { "properties": { "kind": { "const": "block_verified" }, "data": { "$ref": "#/$defs/block_verified" } } },
+    { "properties": { "kind": { "const": "block_accepted" }, "data": { "$ref": "#/$defs/block_accepted" } } },
+    { "properties": { "kind": { "const": "block_rejected" }, "data": { "$ref": "#/$defs/block_rejected" } } },
+    { "properties": { "kind": { "const": "block_orphaned" }, "data": { "$ref": "#/$defs/block_orphaned" } } },
+    { "properties": { "kind": { "const": "proof_verified" }, "data": { "$ref": "#/$defs/proof_verified" } } },
+    { "properties": { "kind": { "const": "mempool_snapshot" }, "data": { "$ref": "#/$defs/mempool_snapshot" } } },
+    { "properties": { "kind": { "const": "peer_connected" }, "data": { "$ref": "#/$defs/peer" } } },
+    { "properties": { "kind": { "const": "peer_disconnected" }, "data": { "$ref": "#/$defs/peer" } } },
+    { "properties": { "kind": { "const": "node_started" }, "data": { "$ref": "#/$defs/node_started" } } }
+  ],
+  "$defs": {
+    "TxId": { "type": "string", "pattern": "^tx:[0-9a-f]{64}$" },
+    "BlockHash": { "type": "string", "pattern": "^blk:[0-9a-f]{64}$" },
+    "CircuitId": { "type": "string", "pattern": "^circ:[0-9a-f]{64}$" },
+    "Address": { "type": "string", "pattern": "^addr:[0-9a-f]{64}$" },
+    "ProofHash": { "type": "string", "pattern": "^proof:[0-9a-f]{64}$" },
+    "FieldElement": { "type": "string", "pattern": "^0x[0-9a-f]{62}$" },
+    "U64": { "type": "integer", "minimum": 0 },
+    "ProofSystem": { "enum": ["groth16", "plonk_kzg", "marlin"] },
+    "ReasonCode": { "type": "string", "pattern": "^[a-z][a-z0-9_]*$" },
+    "tx_received": {
+      "type": "object", "additionalProperties": false,
+      "required": ["txid", "tx_kind", "sender", "fee"],
+      "properties": {
+        "txid": { "$ref": "#/$defs/TxId" },
+        "tx_kind": { "enum": ["transfer", "proof_request", "register_circuit"] },
+        "sender": { "$ref": "#/$defs/Address" },
+        "fee": { "$ref": "#/$defs/U64" }
+      }
+    },
+    "tx_rejected": {
+      "type": "object", "additionalProperties": false,
+      "required": ["reason_code", "message"],
+      "properties": {
+        "txid": { "$ref": "#/$defs/TxId" },
+        "reason_code": { "$ref": "#/$defs/ReasonCode" },
+        "message": { "type": "string" }
+      }
+    },
+    "proof_request_started": {
+      "type": "object", "additionalProperties": false,
+      "required": ["txid", "circuit", "system"],
+      "properties": {
+        "txid": { "$ref": "#/$defs/TxId" },
+        "circuit": { "$ref": "#/$defs/CircuitId" },
+        "system": { "$ref": "#/$defs/ProofSystem" }
+      }
+    },
+    "proof_produced": {
+      "type": "object", "additionalProperties": false,
+      "required": ["txid", "circuit", "system", "prove_ms", "proof_hash"],
+      "properties": {
+        "txid": { "$ref": "#/$defs/TxId" },
+        "circuit": { "$ref": "#/$defs/CircuitId" },
+        "system": { "$ref": "#/$defs/ProofSystem" },
+        "prove_ms": { "$ref": "#/$defs/U64" },
+        "proof_hash": { "$ref": "#/$defs/ProofHash" }
+      }
+    },
+    "lottery_result": {
+      "type": "object", "additionalProperties": false,
+      "required": ["txid", "proof_hash", "circuit", "won", "eta", "mask", "usage_counter"],
+      "properties": {
+        "txid": { "$ref": "#/$defs/TxId" },
+        "proof_hash": { "$ref": "#/$defs/ProofHash" },
+        "circuit": { "$ref": "#/$defs/CircuitId" },
+        "won": { "type": "boolean" },
+        "eta": { "$ref": "#/$defs/FieldElement" },
+        "mask": { "$ref": "#/$defs/FieldElement" },
+        "usage_counter": { "$ref": "#/$defs/U64" }
+      }
+    },
+    "block_received": {
+      "type": "object", "additionalProperties": false,
+      "required": ["hash", "height", "from_peer"],
+      "properties": {
+        "hash": { "$ref": "#/$defs/BlockHash" },
+        "height": { "$ref": "#/$defs/U64" },
+        "from_peer": { "type": "string" }
+      }
+    },
+    "block_verified": {
+      "type": "object", "additionalProperties": false,
+      "required": ["hash", "height", "verify_ms", "proof_count", "ok"],
+      "properties": {
+        "hash": { "$ref": "#/$defs/BlockHash" },
+        "height": { "$ref": "#/$defs/U64" },
+        "verify_ms": { "$ref": "#/$defs/U64" },
+        "proof_count": { "$ref": "#/$defs/U64" },
+        "ok": { "type": "boolean" }
+      }
+    },
+    "block_accepted": {
+      "type": "object", "additionalProperties": false,
+      "required": ["hash", "height", "miner", "tx_count", "proof_count", "bucket_count", "bucket_id"],
+      "properties": {
+        "hash": { "$ref": "#/$defs/BlockHash" },
+        "height": { "$ref": "#/$defs/U64" },
+        "miner": { "$ref": "#/$defs/Address" },
+        "tx_count": { "$ref": "#/$defs/U64" },
+        "proof_count": { "$ref": "#/$defs/U64" },
+        "bucket_count": { "type": "integer", "minimum": 1, "maximum": 4294967295 },
+        "bucket_id": { "type": "integer", "minimum": 0, "maximum": 4294967295 }
+      }
+    },
+    "block_rejected": {
+      "type": "object", "additionalProperties": false,
+      "required": ["hash", "reason_code"],
+      "properties": {
+        "hash": { "$ref": "#/$defs/BlockHash" },
+        "height": { "$ref": "#/$defs/U64" },
+        "reason_code": { "$ref": "#/$defs/ReasonCode" }
+      }
+    },
+    "block_orphaned": {
+      "type": "object", "additionalProperties": false,
+      "required": ["hash", "height"],
+      "properties": {
+        "hash": { "$ref": "#/$defs/BlockHash" },
+        "height": { "$ref": "#/$defs/U64" }
+      }
+    },
+    "proof_verified": {
+      "type": "object", "additionalProperties": false,
+      "required": ["txid", "proof_hash", "system", "verify_ms", "ok"],
+      "properties": {
+        "txid": { "$ref": "#/$defs/TxId" },
+        "proof_hash": { "$ref": "#/$defs/ProofHash" },
+        "system": { "$ref": "#/$defs/ProofSystem" },
+        "verify_ms": { "$ref": "#/$defs/U64" },
+        "ok": { "type": "boolean" }
+      }
+    },
+    "mempool_snapshot": {
+      "type": "object", "additionalProperties": false,
+      "required": ["pending_txs", "pending_proof_requests", "by_circuit"],
+      "properties": {
+        "pending_txs": { "$ref": "#/$defs/U64" },
+        "pending_proof_requests": { "$ref": "#/$defs/U64" },
+        "by_circuit": {
+          "type": "object",
+          "propertyNames": { "$ref": "#/$defs/CircuitId" },
+          "additionalProperties": { "$ref": "#/$defs/U64" }
+        }
+      }
+    },
+    "peer": {
+      "type": "object", "additionalProperties": false,
+      "required": ["peer_id"],
+      "properties": { "peer_id": { "type": "string", "minLength": 1 } }
+    },
+    "node_started": {
+      "type": "object", "additionalProperties": false,
+      "required": ["chain_id", "version", "height"],
+      "properties": {
+        "chain_id": { "type": "integer", "minimum": 0, "maximum": 4294967295 },
+        "version": { "type": "string" },
+        "height": { "$ref": "#/$defs/U64" }
+      }
+    }
+  }
+}

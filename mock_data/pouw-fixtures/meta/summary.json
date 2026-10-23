@@ -1,0 +1,84 @@
+{
+  "chain_id": 1001,
+  "blocks": 60,
+  "bucket_count": 8,
+  "nodes": [
+    "node-a",
+    "miner-1",
+    "miner-2"
+  ],
+  "event_counts": {
+    "node-a": {
+      "node_started": 1,
+      "peer_connected": 3,
+      "tx_received": 213,
+      "block_received": 63,
+      "block_verified": 62,
+      "block_accepted": 61,
+      "mempool_snapshot": 30,
+      "proof_verified": 73,
+      "tx_rejected": 4,
+      "block_rejected": 2,
+      "block_orphaned": 1
+    },
+    "miner-1": {
+      "node_started": 1,
+      "peer_connected": 3,
+      "tx_received": 213,
+      "block_accepted": 61,
+      "mempool_snapshot": 30,
+      "block_received": 39,
+      "proof_verified": 45,
+      "block_verified": 38,
+      "proof_request_started": 36,
+      "proof_produced": 36,
+      "lottery_result": 36,
+      "tx_rejected": 7,
+      "block_rejected": 2,
+      "block_orphaned": 1,
+      "peer_disconnected": 1
+    },
+    "miner-2": {
+      "node_started": 1,
+      "peer_connected": 3,
+      "tx_received": 213,
+      "tx_rejected": 4,
+      "block_received": 26,
+      "block_verified": 25,
+      "block_accepted": 60,
+      "proof_request_started": 48,
+      "mempool_snapshot": 30,
+      "proof_produced": 48,
+      "lottery_result": 48,
+      "proof_verified": 29,
+      "block_rejected": 2,
+      "peer_disconnected": 1
+    }
+  },
+  "scenarios": {
+    "fork": {
+      "orphaned_block": "blk:d237b8eb935f77bc8258c648dc951fa6a809ee3593e9cb1ee50964651f697763",
+      "height": 22
+    },
+    "rejected_blocks": [
+      {
+        "hash": "blk:9600f2e8afcdd1c7e6b860855695cef6b1de0a8c4908e6f8eff8bd30a774d437",
+        "height": 12,
+        "reason": "invalid_proof"
+      },
+      {
+        "hash": "blk:1155aaf01f195ecc0112c031b6ebb9514338ff98d3b6078de337d2b125f8deaf",
+        "height": 33,
+        "reason": "bad_bucket"
+      }
+    ],
+    "peer_flap": "miner-1 <-> miner-2 at about 2026-10-19T14:02:30Z"
+  },
+  "tx_rejected_reasons": {
+    "unknown_circuit": 7,
+    "bad_signature": 2,
+    "insufficient_balance": 3,
+    "bad_nonce": 1,
+    "bad_chain_id": 2
+  }
+}
