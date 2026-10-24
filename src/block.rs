@@ -1,5 +1,4 @@
-//! Block layout from pouw-docs contracts/block.md, decoded with borsh.
-//! Field order in each struct is the wire order, do not reorder fields.
+// Field order in each struct is the wire order, do not reorder fields.
 
 use borsh::{BorshDeserialize, BorshSerialize};
 use sha2::{Digest, Sha256};
@@ -74,7 +73,7 @@ pub struct ProofTx {
 #[derive(Debug, Clone, PartialEq, BorshSerialize, BorshDeserialize)]
 pub struct Block {
     pub header: BlockHeader,
-    pub txs: Vec<SignedTx>,        // transfers and circuit registrations
+    pub txs: Vec<SignedTx>, // transfers and circuit registrations
     pub proof_txs: Vec<ProofTx>,
 }
 
@@ -124,7 +123,10 @@ mod tests {
 
     #[test]
     fn fixture_blocks_decode_and_hashes_match() {
-        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/blocks.borsh.jsonl");
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/blocks.borsh.jsonl"
+        );
         let text = std::fs::read_to_string(path).expect("fixture file is missing");
         let mut count = 0;
         let mut proofs = 0;
