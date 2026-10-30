@@ -1,0 +1,19 @@
+# Postgres for local development and `cargo test`:
+#   docker compose up -d
+#   DATABASE_URL=postgres://pouw:pouw@localhost:5432/pouw_indexer cargo run
+# The port is only on 127.0.0.1, the password is for this laptop only.
+# The whole network (node, indexer, Hasura, dashboard) runs from pouw-deploy: make dev
+services:
+  db:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: pouw
+      POSTGRES_PASSWORD: pouw
+      POSTGRES_DB: pouw_indexer
+    ports:
+      - "127.0.0.1:5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+
+volumes:
+  pgdata:

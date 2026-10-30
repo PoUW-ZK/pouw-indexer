@@ -17,3 +17,12 @@ updates:
   #     dependencies:
   #       patterns: ["*"]
 
+
+  # Base images of the Dockerfile
+  - package-ecosystem: docker
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      images:
+        patterns: ["*"]

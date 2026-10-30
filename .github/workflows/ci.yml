@@ -1,11 +1,22 @@
 name: CI
 
 on:
-  push:
+  workflow_dispatch:
   pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
-  check:
+  # The name ci-ok is the check required for merge (ruleset protect-main)
+  ci-ok:
+    name: ci-ok
     runs-on: ubuntu-latest
 
     # A real Postgres for the tests that touch the database.
@@ -41,7 +52,25 @@ jobs:
         run: cargo fmt --check
 
       - name: Lints (warnings are errors)
-        run: cargo clippy --all-targets -- -D warnings
+        run: cargo clippy --all-targets --locked -- -D warnings
 
       - name: Tests
-        run: cargo test
+        run: cargo test --locked
+
+      - name: Dockerfile lint (hadolint)
+        if: hashFiles('Dockerfile') != ''
+        run: docker run --rm -i ghcr.io/hadolint/hadolint < Dockerfile
+
+      # The image that pouw-deploy runs: it must start, migrate the database and serve /health
+      - name: Docker image starts
+        if: hashFiles('Dockerfile') != ''
+        run: |
+          docker build -t pouw-indexer:ci .
+          docker run -d --name indexer --network host -e DATABASE_URL pouw-indexer:ci
+          for _ in $(seq 30); do
+            curl -fsS -o /dev/null http://localhost:8000/health && exit 0
+            sleep 2
+          done
+          docker logs indexer
+          echo "::error::The indexer image did not serve /health within 60 s"
+          exit 1

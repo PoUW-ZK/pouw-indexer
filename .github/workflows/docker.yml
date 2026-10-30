@@ -1,9 +1,9 @@
 name: Docker image
 
 # Publishes an image to GitHub Container Registry: ghcr.io/pouw-zk/<repository>
-# main  -> tagy :main a :sha-xxxxxxx
-# v1.2.3 -> tagy :v1.2.3 a :latest
-# As long as there is no Dockerfile in the repository, the workflow will simply display a message.
+# main   -> tags :main and :sha-xxxxxxx
+# v1.2.3 -> tags :v1.2.3 and :latest
+# As long as there is no Dockerfile, the workflow only prints a message.
 
 on:
   push:

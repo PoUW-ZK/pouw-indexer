@@ -1,0 +1,5 @@
+.git
+target
+e2e
+mock_data
+.env

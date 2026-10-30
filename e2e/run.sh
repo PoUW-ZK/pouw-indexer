@@ -40,5 +40,5 @@ docker run --rm \
     -v "$junit_dir:/reports" \
     -w /e2e \
     python:3.12-slim \
-    sh -c "pip install -q --user -r requirements.txt &&
+    sh -c "pip install -q --user --no-warn-script-location -r requirements.txt &&
         python -m pytest -p no:cacheprovider -o junit_suite_name=$repo --junitxml=/reports/$repo.xml"

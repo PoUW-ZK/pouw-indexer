@@ -10,12 +10,15 @@ Add a `test_*.py` file here, nothing else is needed:
 import requests
 
 
-def test_health():
-    r = requests.get("http://indexer:8000/health", timeout=10)
+def test_health(service):
+    r = requests.get(service("indexer", 8000) + "/health", timeout=10)
     assert r.status_code == 200
 ```
 
-If you want use different language instead Python, communicate with @Faustynn, and after you need to provide a `run.sh` script.
+`service(name, port)` (from `conftest.py`) gives the base URL and skips the test
+when that service does not run in the network (its profile in pouw-deploy is off).
+
+For a language other than Python, agree it with @Faustynn and replace the body of `run.sh`.
 
 - Services are reached by their name in `compose.yml` of `pouw-deploy`, there
   are no ports on the host.
@@ -23,12 +26,15 @@ If you want use different language instead Python, communicate with @Faustynn, a
 - Tests that are not pytest: replace the body of `run.sh` and keep its
   contract (argument, `JUNIT_DIR`, exit code).
 
-Run locally from `pouw-deploy`: images are built from `main`, the tests are
-taken from your working copies next to it.
+Run locally from `pouw-deploy` next to this clone: every service is built from
+your working copies (uncommitted changes too), the tests are taken from them.
 
 ```bash
-make images test IMAGE_TAG=local E2E_SRC=..
+make dev-test
 make test-down
 ```
+
+How to write unit, smoke, integration and e2e tests: the README of pouw-deploy,
+section Tests.
 
 More in the docs: CI/CD, section E2E tests of services.

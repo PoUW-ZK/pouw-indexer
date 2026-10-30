@@ -1,0 +1,14 @@
+# LF everywhere, also in checkouts on Windows (core.autocrlf=true). Scripts,
+# Dockerfiles and configs run in Linux containers, where CRLF breaks them
+# (e.g. "/usr/bin/env: 'bash\r': No such file or directory").
+* text=auto eol=lf
+
+# Windows-only scripts keep CRLF
+*.bat text eol=crlf
+*.cmd text eol=crlf
+*.ps1 text eol=crlf
+
+*.jar binary
+*.png binary
+*.jpg binary
+*.ico binary
