@@ -1,7 +1,7 @@
 //! Write decoded blocks into Postgres.
 
 use anyhow::Context;
-use sqlx::PgPool;
+use sqlx::{PgConnection, PgPool};
 
 use crate::block::{Block, ProofSystem, TxKind, sha256};
 
@@ -17,21 +17,70 @@ fn system_name(s: ProofSystem) -> &'static str {
     }
 }
 
-/// Insert one block and everything inside it, in one database transaction.
-/// Returns false if the block was already there (nothing is written then),
-/// so running the same input twice is safe.
+/// Insert one block in its own transaction. See `insert_block_tx`.
+pub async fn insert_block(pool: &PgPool, block: &Block) -> anyhow::Result<bool> {
+    let mut tx = pool.begin().await?;
+    let inserted = insert_block_tx(&mut tx, block).await?;
+    tx.commit().await?;
+    Ok(inserted)
+}
+
+/// Write a circuit registration. If the circuit is already known but the block that
+/// registered it was dropped by a reorganisation, point it at this block instead.
+async fn upsert_circuit(
+    conn: &mut PgConnection,
+    block_hash: &[u8; 32],
+    height: u64,
+    txid: &[u8; 32],
+    tx: &crate::block::SignedTx,
+) -> anyhow::Result<()> {
+    let TxKind::RegisterCircuit {
+        system,
+        constraint_count,
+        verifying_key,
+        circuit,
+    } = &tx.body.kind
+    else {
+        return Ok(());
+    };
+    sqlx::query(
+        "INSERT INTO circuits (circuit_id, proof_system, constraint_count, verifying_key_bytes, \
+         circuit_bytes, registrant, fee, registered_block, registered_height) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) \
+         ON CONFLICT (circuit_id) DO UPDATE SET registered_block = EXCLUDED.registered_block, \
+             registered_height = EXCLUDED.registered_height, fee = EXCLUDED.fee \
+         WHERE circuits.registered_block <> EXCLUDED.registered_block \
+           AND EXISTS (SELECT 1 FROM blocks o WHERE o.hash = circuits.registered_block AND NOT o.canonical)",
+    )
+    .bind(&txid[..])
+    .bind(system_name(*system))
+    .bind(num(*constraint_count)?)
+    .bind(verifying_key.len() as i32)
+    .bind(circuit.len() as i32)
+    .bind(&tx.body.sender[..])
+    .bind(num(tx.body.fee)?)
+    .bind(&block_hash[..])
+    .bind(num(height)?)
+    .execute(&mut *conn)
+    .await?;
+    Ok(())
+}
+
+/// Insert one block and everything inside it, using the caller's transaction, so many
+/// blocks and a checkpoint can be committed together.
+/// Returns true if the block is new. A block that is already there writes nothing,
+/// except that one a reorganisation had dropped is made canonical again.
 ///
 /// Blocks must come in height order: proof requests point to circuits that an
 /// earlier block registered, and the database enforces that.
-pub async fn insert_block(pool: &PgPool, block: &Block) -> anyhow::Result<bool> {
+pub async fn insert_block_tx(conn: &mut PgConnection, block: &Block) -> anyhow::Result<bool> {
     let h = &block.header;
     let hash = h.hash();
     let size = borsh::to_vec(block)?.len() as i32;
-    let mut tx = pool.begin().await?;
 
     sqlx::query("INSERT INTO miners (address) VALUES ($1) ON CONFLICT DO NOTHING")
         .bind(&h.miner[..])
-        .execute(&mut *tx)
+        .execute(&mut *conn)
         .await?;
 
     let inserted = sqlx::query(
@@ -51,12 +100,24 @@ pub async fn insert_block(pool: &PgPool, block: &Block) -> anyhow::Result<bool> 
     .bind(h.tx_count as i32)
     .bind(&h.tx_root[..])
     .bind(size)
-    .execute(&mut *tx)
+    .execute(&mut *conn)
     .await?
     .rows_affected();
 
     if inserted == 0 {
-        return Ok(false); // already indexed
+        // Known block. After a reorganisation it may have been orphaned and the node's chain
+        // went back to it: make it canonical again and re-point its circuits.
+        let revived = sqlx::query("UPDATE blocks SET canonical = TRUE, orphaned_at = NULL WHERE hash = $1 AND NOT canonical")
+            .bind(&hash[..])
+            .execute(&mut *conn)
+            .await?
+            .rows_affected();
+        if revived > 0 {
+            for stx in &block.txs {
+                upsert_circuit(conn, &hash, h.height, &stx.txid(), stx).await?;
+            }
+        }
+        return Ok(false);
     }
 
     // transfers and circuit registrations (block.txs)
@@ -77,31 +138,11 @@ pub async fn insert_block(pool: &PgPool, block: &Block) -> anyhow::Result<bool> 
                 .bind(num(*amount)?)
                 .bind(num(b.fee)?)
                 .bind(num(b.nonce)?)
-                .execute(&mut *tx)
+                .execute(&mut *conn)
                 .await?;
             }
-            TxKind::RegisterCircuit {
-                system,
-                constraint_count,
-                verifying_key,
-                circuit,
-            } => {
-                sqlx::query(
-                    "INSERT INTO circuits (circuit_id, proof_system, constraint_count, verifying_key_bytes, \
-                     circuit_bytes, registrant, fee, registered_block, registered_height) \
-                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) ON CONFLICT DO NOTHING",
-                )
-                .bind(&txid[..])
-                .bind(system_name(*system))
-                .bind(num(*constraint_count)?)
-                .bind(verifying_key.len() as i32)
-                .bind(circuit.len() as i32)
-                .bind(&b.sender[..])
-                .bind(num(b.fee)?)
-                .bind(&hash[..])
-                .bind(num(h.height)?)
-                .execute(&mut *tx)
-                .await?;
+            TxKind::RegisterCircuit { .. } => {
+                upsert_circuit(conn, &hash, h.height, &txid, stx).await?;
             }
             TxKind::ProofRequest { .. } => {
                 anyhow::bail!(
@@ -149,11 +190,10 @@ pub async fn insert_block(pool: &PgPool, block: &Block) -> anyhow::Result<bool> 
         .bind(witness.len() as i32)
         .bind(&witness_hash[..])
         .bind(public_inputs.len() as i32)
-        .execute(&mut *tx)
+        .execute(&mut *conn)
         .await?;
     }
 
-    tx.commit().await?;
     Ok(true)
 }
 
