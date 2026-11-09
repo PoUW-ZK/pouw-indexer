@@ -54,6 +54,10 @@ async fn seed(path: String) -> anyhow::Result<()> {
             added += 1;
         }
     }
+    // statistics are materialized views since migration 0003
+    sqlx::query("SELECT api.refresh_stats()")
+        .execute(&pool)
+        .await?;
     println!(
         "seed: {} blocks read from {path}, {added} new, {} already there",
         blocks.len(),
