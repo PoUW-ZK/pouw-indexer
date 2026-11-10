@@ -9,8 +9,12 @@ axum = "0.8.9"
 borsh = { version = "1.8.1", features = ["derive"] }
 dotenv = "0.15.0"
 hex = "0.4.3"
+prometheus = "0.14.0"
+reqwest = { version = "0.13.5", features = ["json", "query"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
 sha2 = "0.11.1"
 sqlx = { version = "0.8.6", features = ["postgres", "runtime-tokio", "migrate"] }
 tokio = { version = "1.54.1", features = ["full"] }
+pouw-api = { git = "https://github.com/PoUW-ZK/pouw-node", rev = "b215a16" }
+pouw-types = { git = "https://github.com/PoUW-ZK/pouw-node", rev = "b215a16" }
