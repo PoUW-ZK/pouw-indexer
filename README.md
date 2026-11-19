@@ -56,6 +56,22 @@ tracks.
 | `0007_accounts` | `accounts` (balance, nonce from the node), `account_refresh`, `api.accounts` |
 | `0008_network_stats` | `network_stats`: chain statistics per minute for Grafana |
 | `0009_typed_node_id` | node ids checked like in the node |
+| `0010_load` | counters on `blocks`, `network_stats` with `transfers_per_s`, `txs_per_s`, `fees`, `transfer_fees`; one index added, three unused ones dropped |
+
+## Load
+
+Blocks with hundreds of transfers (`make load SCENARIO=transfers` in pouw-deploy):
+
+- the transfers of a block are written with one `INSERT ... UNNEST`, not one statement each;
+- `blocks` carries the counters (`transfer_count`, `fee_total`, ...) written with the block, so
+  `api.blocks` and `network_stats` do not count rows;
+- balances are copied from the node 16 requests at a time, and while the indexer is behind it
+  copies one batch per round, the rest waits in `account_refresh`;
+- the materialized statistics are refreshed at most every 2 s (at once after a reorganisation);
+- `pouw_indexer_lag_blocks` is what the `IndexerLagging` alert should watch.
+
+`scripts/explain.sql` builds a large scratch database and prints the plans of the explorer's
+queries. Run it after any change of a view or an index.
 
 A new column or view the explorer needs: a migration here, then the Hasura
 metadata and, for a new query, the contract and the allow-list in

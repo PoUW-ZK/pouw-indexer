@@ -7,11 +7,7 @@ use pouw_types::{Block, ProofTx, TxKind, block_id, encoded_len, txid};
 use sqlx::Row;
 
 use super::{Checkpoint, Hash, Store, Tx, num, unsigned};
-use crate::error::StoreError;
-
-fn bad(msg: String) -> StoreError {
-    StoreError::BadData(msg)
-}
+use crate::error::{BlockError, BlockField, StoreError};
 
 /// The block as the node stores it, rebuilt from its view.
 fn to_block(v: &BlockView) -> Block {
@@ -36,21 +32,15 @@ fn to_block(v: &BlockView) -> Block {
 fn check_consistent(v: &BlockView, block: &Block) -> Result<(), StoreError> {
     let height = v.header.height.get();
     if block_id(&v.header) != v.id {
-        return Err(bad(format!(
-            "block {height}: the id does not match the header"
-        )));
+        return Err(BlockError::IdMismatch { height }.into());
     }
     for t in v.txs.iter().chain(v.proof_txs.iter().map(|p| &p.request)) {
         if txid(&t.tx) != t.txid {
-            return Err(bad(format!(
-                "block {height}: a txid does not match its transaction"
-            )));
+            return Err(BlockError::TxidMismatch { height }.into());
         }
     }
     if height > 0 && block.compute_tx_root() != v.header.tx_root {
-        return Err(bad(format!(
-            "block {height}: tx_root does not match the transactions"
-        )));
+        return Err(BlockError::TxRootMismatch { height }.into());
     }
     Ok(())
 }
@@ -84,8 +74,8 @@ async fn upsert_circuit(
     .bind(&t.txid.hash().0[..])
     .bind(system.as_str())
     .bind(num(constraint_count.0)?)
-    .bind(i32::try_from(verifying_key.len()).map_err(|_| bad("verifying key is too long".into()))?)
-    .bind(i32::try_from(circuit.len()).map_err(|_| bad("circuit is too long".into()))?)
+    .bind(too_large(verifying_key.len(), height, BlockField::VerifyingKey)?)
+    .bind(too_large(circuit.len(), height, BlockField::Circuit)?)
     .bind(&t.tx.body.sender.0[..])
     .bind(num(t.tx.body.fee.0)?)
     .bind(&block_hash[..])
@@ -93,6 +83,80 @@ async fn upsert_circuit(
     .execute(&mut **tx)
     .await?;
     Ok(())
+}
+
+/// A length or a count as the INTEGER of a column. Too large is bad data, not a panic.
+fn too_large<T>(n: T, height: u64, field: BlockField) -> Result<i32, BlockError>
+where
+    i32: TryFrom<T>,
+{
+    i32::try_from(n).map_err(|_| BlockError::TooLarge { height, field })
+}
+
+/// Sum of fees. A sum that does not fit in a u64 is bad data, not a panic.
+fn add_fee(total: u64, fee: u64, height: u64) -> Result<u64, BlockError> {
+    total
+        .checked_add(fee)
+        .ok_or(BlockError::FeeOverflow { height })
+}
+
+/// The transfers of one block, column by column, ready for `UNNEST`.
+#[derive(Default)]
+struct TransferRows {
+    pos: Vec<i32>,
+    txid: Vec<Vec<u8>>,
+    sender: Vec<Vec<u8>>,
+    recipient: Vec<Vec<u8>>,
+    amount: Vec<i64>,
+    fee: Vec<i64>,
+    nonce: Vec<i64>,
+    /// Sum of the fees, for the block counters.
+    fees: u64,
+}
+
+impl TransferRows {
+    fn push(
+        &mut self,
+        height: u64,
+        pos: i32,
+        t: &SignedTxView,
+        to: Hash,
+        amount: u64,
+    ) -> Result<(), StoreError> {
+        let b = &t.tx.body;
+        self.pos.push(pos);
+        self.txid.push(t.txid.hash().0.to_vec());
+        self.sender.push(b.sender.0.to_vec());
+        self.recipient.push(to.to_vec());
+        self.amount.push(num(amount)?);
+        self.fee.push(num(b.fee.0)?);
+        self.nonce.push(num(b.nonce.0)?);
+        self.fees = add_fee(self.fees, b.fee.0, height)?;
+        Ok(())
+    }
+
+    async fn write(&self, tx: &mut Tx<'_>, block_hash: &Hash) -> Result<(), StoreError> {
+        if self.pos.is_empty() {
+            return Ok(());
+        }
+        sqlx::query(
+            "INSERT INTO transfers (block_hash, position, txid, sender, recipient, amount, fee, nonce) \
+             SELECT $1::bytea, u.position, u.txid, u.sender, u.recipient, u.amount, u.fee, u.nonce \
+             FROM UNNEST($2::int4[], $3::bytea[], $4::bytea[], $5::bytea[], $6::int8[], $7::int8[], $8::int8[]) \
+                  AS u (position, txid, sender, recipient, amount, fee, nonce)",
+        )
+        .bind(&block_hash[..])
+        .bind(&self.pos)
+        .bind(&self.txid)
+        .bind(&self.sender)
+        .bind(&self.recipient)
+        .bind(&self.amount)
+        .bind(&self.fee)
+        .bind(&self.nonce)
+        .execute(&mut **tx)
+        .await?;
+        Ok(())
+    }
 }
 
 /// Queue every address the block touches to be copied from the node again.
@@ -117,10 +181,8 @@ pub async fn insert_block(tx: &mut Tx<'_>, view: &BlockView) -> Result<bool, Sto
     let hash = view.id.hash().0;
     let block = to_block(view);
     check_consistent(view, &block)?;
-    let size = i32::try_from(encoded_len(&block))
-        .map_err(|_| bad(format!("block {height} is too large")))?;
-    let leaves = i32::try_from(block.leaf_count())
-        .map_err(|_| bad(format!("block {height} has too many entries")))?;
+    let size = too_large(encoded_len(&block), height, BlockField::Size)?;
+    let leaves = too_large(block.leaf_count(), height, BlockField::Entries)?;
 
     sqlx::query("INSERT INTO miners (address) VALUES ($1) ON CONFLICT DO NOTHING")
         .bind(&h.miner.0[..])
@@ -168,50 +230,54 @@ pub async fn insert_block(tx: &mut Tx<'_>, view: &BlockView) -> Result<bool, Sto
         return Ok(false);
     }
 
-    // transfers and circuit registrations (block.txs)
+    // Transfers and circuit registrations (block.txs). A block can hold hundreds of transfers,
+    // so they are collected and written with one statement instead of one round trip each.
+    // Registrations are few and go one by one. The counters are written at the end.
+    let mut transfers = TransferRows::default();
+    let mut registrations = 0usize;
+    let mut registration_fees = 0u64;
     for (pos, t) in view.txs.iter().enumerate() {
         let b = &t.tx.body;
         match &b.kind {
-            TxKind::Transfer { to, amount } => {
-                sqlx::query(
-                    "INSERT INTO transfers (block_hash, position, txid, sender, recipient, amount, fee, nonce) \
-                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
-                )
-                .bind(&hash[..])
-                .bind(i32::try_from(pos).map_err(|_| bad("too many transactions".into()))?)
-                .bind(&t.txid.hash().0[..])
-                .bind(&b.sender.0[..])
-                .bind(&to.0[..])
-                .bind(num(amount.0)?)
-                .bind(num(b.fee.0)?)
-                .bind(num(b.nonce.0)?)
-                .execute(&mut **tx)
-                .await?;
+            TxKind::Transfer { to, amount } => transfers.push(
+                height,
+                too_large(pos, height, BlockField::Position)?,
+                t,
+                to.0,
+                amount.0,
+            )?,
+            TxKind::RegisterCircuit { .. } => {
+                upsert_circuit(tx, &hash, height, t).await?;
+                registrations += 1;
+                registration_fees = add_fee(registration_fees, b.fee.0, height)?;
             }
-            TxKind::RegisterCircuit { .. } => upsert_circuit(tx, &hash, height, t).await?,
             _ => {
-                return Err(bad(format!(
-                    "block {height}: entry {pos} of txs is not a transfer or a registration"
-                )));
+                return Err(BlockError::UnexpectedTx {
+                    height,
+                    position: pos,
+                }
+                .into());
             }
         }
     }
+    transfers.write(tx, &hash).await?;
 
-    // proof requests with their proofs (block.proof_txs)
+    // proof requests with their proofs (block.proof_txs), at most a few per block
+    let mut proof_fees = 0u64;
     for (pos, p) in view.proof_txs.iter().enumerate() {
         let b = &p.request.tx.body;
+        proof_fees = add_fee(proof_fees, b.fee.0, height)?;
         let TxKind::ProofRequest {
             circuit,
             public_inputs,
             witness,
         } = &b.kind
         else {
-            return Err(bad(format!(
-                "block {height}: proof_txs entry {pos} is not a proof request"
-            )));
-        };
-        let len = |n: usize| {
-            i32::try_from(n).map_err(|_| bad(format!("block {height}: a field is too long")))
+            return Err(BlockError::NotAProofRequest {
+                height,
+                position: pos,
+            }
+            .into());
         };
         sqlx::query(
             "INSERT INTO proof_txs (block_hash, position, proof_hash, request_txid, circuit_id, requester, \
@@ -219,7 +285,7 @@ pub async fn insert_block(tx: &mut Tx<'_>, view: &BlockView) -> Result<bool, Sto
              VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)",
         )
         .bind(&hash[..])
-        .bind(len(pos)?)
+        .bind(too_large(pos, height, BlockField::Position)?)
         .bind(&p.proof_hash.hash().0[..])
         .bind(&p.request_txid.hash().0[..])
         .bind(&circuit.hash().0[..])
@@ -227,15 +293,42 @@ pub async fn insert_block(tx: &mut Tx<'_>, view: &BlockView) -> Result<bool, Sto
         .bind(num(b.fee.0)?)
         .bind(num(b.nonce.0)?)
         .bind(num(p.usage_counter.0)?)
-        .bind(len(p.proof.len())?)
-        .bind(len(witness.len())?)
+        .bind(too_large(p.proof.len(), height, BlockField::ProofBytes)?)
+        .bind(too_large(witness.len(), height, BlockField::WitnessBytes)?)
         .bind(&sha256(&[witness]).0[..])
-        .bind(len(public_inputs.len())?)
+        .bind(too_large(public_inputs.len(), height, BlockField::PublicInputs)?)
         .bind(&p.eta.0[..])
         .bind(&p.mask.0[..])
         .execute(&mut **tx)
         .await?;
     }
+
+    // The numbers that api.blocks and network_stats read (migration 0010).
+    let fee_total = add_fee(
+        add_fee(transfers.fees, registration_fees, height)?,
+        proof_fees,
+        height,
+    )?;
+    sqlx::query(
+        "UPDATE blocks SET transfer_count = $2, registration_count = $3, proof_count = $4, \
+         transfer_fees = $5, fee_total = $6, \
+         useful_work = (SELECT coalesce(sum(ci.constraint_count), 0)::bigint \
+                          FROM proof_txs p JOIN circuits ci ON ci.circuit_id = p.circuit_id \
+                         WHERE p.block_hash = $1) \
+         WHERE hash = $1",
+    )
+    .bind(&hash[..])
+    .bind(too_large(
+        transfers.pos.len(),
+        height,
+        BlockField::Transfers,
+    )?)
+    .bind(too_large(registrations, height, BlockField::Registrations)?)
+    .bind(too_large(view.proof_txs.len(), height, BlockField::Proofs)?)
+    .bind(num(transfers.fees)?)
+    .bind(num(fee_total)?)
+    .execute(&mut **tx)
+    .await?;
 
     touch_accounts(tx, &hash).await?;
     Ok(true)
@@ -284,9 +377,9 @@ impl Store {
             .await?;
         let Some(row) = row else { return Ok(None) };
         let (height, hash): (i64, Vec<u8>) = (row.get(0), row.get(1));
-        let hash = hash
-            .try_into()
-            .map_err(|_| bad("sync_state.hash is not 32 bytes".into()))?;
+        let hash = hash.try_into().map_err(|_| StoreError::BadLength {
+            column: "sync_state.hash",
+        })?;
         Ok(Some(Checkpoint {
             height: unsigned(height)?,
             hash,
@@ -301,8 +394,9 @@ impl Store {
                 .fetch_optional(&self.pool)
                 .await?;
         h.map(|h| {
-            h.try_into()
-                .map_err(|_| bad("blocks.hash is not 32 bytes".into()))
+            h.try_into().map_err(|_| StoreError::BadLength {
+                column: "blocks.hash",
+            })
         })
         .transpose()
     }
@@ -409,7 +503,7 @@ mod tests {
         assert!(put(&store, &blocks[0]).await.is_ok());
         assert!(matches!(
             put(&store, &blocks[2]).await,
-            Err(StoreError::BadData(_))
+            Err(StoreError::Block(BlockError::IdMismatch { height: 2 }))
         ));
         assert_eq!(count(&store, "blocks").await, 1);
     }

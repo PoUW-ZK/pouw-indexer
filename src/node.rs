@@ -3,6 +3,7 @@
 
 use std::collections::HashMap;
 use std::future::Future;
+use std::sync::Arc;
 use std::time::Duration;
 
 use pouw_api::view::{AccountView, BlockView, BlocksPage, HeaderView};
@@ -31,13 +32,31 @@ pub trait NodeClient: Send {
         &mut self,
         from: u64,
         to: u64,
-    ) -> impl Future<Output = Result<Vec<BlockView>, NodeError>> + Send;
+    ) -> impl Future<Output = Result<Vec<Arc<BlockView>>, NodeError>> + Send;
     /// Balance and nonce of an address, `None` for an address the chain has not seen.
     fn account(
         &mut self,
         address: Hash,
     ) -> impl Future<Output = Result<Option<AccountView>, NodeError>> + Send;
+    /// Many accounts, answers in the order of `addresses`. The default asks one after another;
+    /// the HTTP client asks several at once, because after a block full of transfers there are
+    /// hundreds of addresses to copy and one request at a time would put the indexer behind.
+    fn accounts(
+        &mut self,
+        addresses: &[Hash],
+    ) -> impl Future<Output = Result<Vec<Option<AccountView>>, NodeError>> + Send {
+        async move {
+            let mut out = Vec::with_capacity(addresses.len());
+            for a in addresses {
+                out.push(self.account(*a).await?);
+            }
+            Ok(out)
+        }
+    }
 }
+
+/// How many account requests the HTTP client keeps open at once.
+const ACCOUNT_REQUESTS_AT_ONCE: usize = 16;
 
 // ------------------------------------------------------------------------------ real client
 
@@ -104,82 +123,135 @@ impl NodeClient for HttpNode {
         })
     }
 
-    async fn blocks(&mut self, from: u64, to: u64) -> Result<Vec<BlockView>, NodeError> {
+    async fn blocks(&mut self, from: u64, to: u64) -> Result<Vec<Arc<BlockView>>, NodeError> {
         let path = pouw_api::path::BLOCKS;
         let resp =
             Self::expect_ok(self.get(path, &[("from", from), ("to", to)]).await?, path).await?;
         let page: BlocksPage = resp.json().await?;
-        Ok(page.blocks)
+        Ok(page.blocks.into_iter().map(Arc::new).collect())
     }
 
     async fn account(&mut self, address: Hash) -> Result<Option<AccountView>, NodeError> {
-        let path = pouw_api::path::ACCOUNT.replace("{addr}", &Address(address).to_string());
-        let resp = self.get(&path, &[]).await?;
-        if resp.status() == reqwest::StatusCode::NOT_FOUND {
-            return Ok(None);
-        }
-        Ok(Some(Self::expect_ok(resp, &path).await?.json().await?))
+        fetch_account(&self.client, &self.base, address).await
     }
+
+    async fn accounts(
+        &mut self,
+        addresses: &[Hash],
+    ) -> Result<Vec<Option<AccountView>>, NodeError> {
+        let mut answers: Vec<Option<Option<AccountView>>> =
+            (0..addresses.len()).map(|_| None).collect();
+        let mut running = tokio::task::JoinSet::new();
+        let mut next = 0;
+        let mut received = 0;
+        while received < addresses.len() {
+            while next < addresses.len() && running.len() < ACCOUNT_REQUESTS_AT_ONCE {
+                let (client, base, address, index) = (
+                    self.client.clone(),
+                    self.base.clone(),
+                    addresses[next],
+                    next,
+                );
+                running.spawn(async move { (index, fetch_account(&client, &base, address).await) });
+                next += 1;
+            }
+            // The first failure ends the call: dropping the set cancels the rest.
+            let (index, answer) = running
+                .join_next()
+                .await
+                .expect("a request is running while answers are missing")
+                .map_err(|e| NodeError::Other(format!("account request: {e}")))?;
+            answers[index] = Some(answer?);
+            received += 1;
+        }
+        Ok(answers
+            .into_iter()
+            .map(|a| a.expect("every address was answered"))
+            .collect())
+    }
+}
+
+/// `GET /v1/accounts/{addr}`: `None` when the node does not know the address (404).
+async fn fetch_account(
+    client: &reqwest::Client,
+    base: &str,
+    address: Hash,
+) -> Result<Option<AccountView>, NodeError> {
+    let path = pouw_api::path::ACCOUNT.replace("{addr}", &Address(address).to_string());
+    let resp = client.get(format!("{base}{path}")).send().await?;
+    if resp.status() == reqwest::StatusCode::NOT_FOUND {
+        return Ok(None);
+    }
+    Ok(Some(HttpNode::expect_ok(resp, &path).await?.json().await?))
 }
 
 // ------------------------------------------------------------------------------ in memory
 
-/// A node that lives in memory, for tests and for running without a node. `set_chain` swaps the
-/// whole chain, which is how tests simulate a reorganisation.
+/// A node that lives in memory, for tests and for running without a node. The fields are public:
+/// a test simulates a reorganisation by assigning another `chain`, and sets what
+/// `GET /v1/accounts/{addr}` answers in `balances`. Blocks are shared (`Arc`), so answering a
+/// request copies pointers, not blocks.
 #[derive(Default)]
 pub struct MemoryNode {
-    chain: Vec<BlockView>,
-    accounts: HashMap<Hash, (u64, u64)>,
+    pub chain: Vec<Arc<BlockView>>,
+    /// address -> (balance, nonce)
+    pub balances: HashMap<Hash, (u64, u64)>,
 }
 
-// Parts of this are only used by tests.
-#[allow(dead_code)]
+/// A chain in the form `MemoryNode::chain` holds it.
+pub fn share(chain: Vec<BlockView>) -> Vec<Arc<BlockView>> {
+    chain.into_iter().map(Arc::new).collect()
+}
+
 impl MemoryNode {
     pub fn new(chain: Vec<BlockView>) -> Self {
         Self {
-            chain,
-            accounts: HashMap::new(),
+            chain: share(chain),
+            balances: HashMap::new(),
         }
-    }
-
-    pub fn set_chain(&mut self, chain: Vec<BlockView>) {
-        self.chain = chain;
-    }
-
-    /// What `GET /v1/accounts/{addr}` answers for this address.
-    pub fn set_account(&mut self, address: Hash, balance: u64, nonce: u64) {
-        self.accounts.insert(address, (balance, nonce));
     }
 }
 
+// Nothing here waits, so the methods return a ready future instead of being `async fn`s.
 impl NodeClient for MemoryNode {
-    async fn head(&mut self) -> Result<Head, NodeError> {
-        let last = self.chain.last().ok_or(NodeError::NoBlocks)?;
-        Ok(Head {
-            height: last.header.height.get(),
-            hash: last.id.hash().0,
-        })
+    fn head(&mut self) -> impl Future<Output = Result<Head, NodeError>> + Send {
+        std::future::ready(
+            self.chain
+                .last()
+                .ok_or(NodeError::NoBlocks)
+                .map(|last| Head {
+                    height: last.header.height.get(),
+                    hash: last.id.hash().0,
+                }),
+        )
     }
 
-    async fn blocks(&mut self, from: u64, to: u64) -> Result<Vec<BlockView>, NodeError> {
-        Ok(self
-            .chain
-            .iter()
-            .filter(|b| (from..=to).contains(&b.header.height.get()))
-            .take(MAX_BLOCKS_PER_CALL)
-            .cloned()
-            .collect())
+    fn blocks(
+        &mut self,
+        from: u64,
+        to: u64,
+    ) -> impl Future<Output = Result<Vec<Arc<BlockView>>, NodeError>> + Send {
+        std::future::ready(Ok::<_, NodeError>(
+            self.chain
+                .iter()
+                .filter(|b| (from..=to).contains(&b.header.height.get()))
+                .take(MAX_BLOCKS_PER_CALL)
+                .map(Arc::clone)
+                .collect(),
+        ))
     }
 
-    async fn account(&mut self, address: Hash) -> Result<Option<AccountView>, NodeError> {
-        Ok(self
-            .accounts
-            .get(&address)
-            .map(|&(balance, nonce)| AccountView {
+    fn account(
+        &mut self,
+        address: Hash,
+    ) -> impl Future<Output = Result<Option<AccountView>, NodeError>> + Send {
+        std::future::ready(Ok::<_, NodeError>(self.balances.get(&address).map(
+            |&(balance, nonce)| AccountView {
                 address: Address(address),
                 balance: Amount(balance),
                 nonce: Nonce(nonce),
-            }))
+            },
+        )))
     }
 }
 
@@ -281,6 +353,22 @@ mod tests {
         let a = node.account([9; 32]).await.unwrap().expect("known address");
         assert_eq!((a.balance.0, a.nonce.0), (500, 3));
         assert!(node.account([8; 32]).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn many_accounts_are_read_at_once_and_come_back_in_order() {
+        let url = serve(ChainBuilder::new(5).take_empty(3), [9; 32]).await;
+        let mut node = HttpNode::new(&url).unwrap();
+        // 40 addresses, more than the requests kept open at once; every fifth one is known
+        let asked: Vec<Hash> = (0..40u8)
+            .map(|i| if i % 5 == 0 { [9; 32] } else { [100 + i; 32] })
+            .collect();
+        let got = node.accounts(&asked).await.unwrap();
+        assert_eq!(got.len(), 40);
+        for (i, a) in got.iter().enumerate() {
+            assert_eq!(a.is_some(), i % 5 == 0, "address number {i}");
+        }
+        assert!(node.accounts(&[]).await.unwrap().is_empty());
     }
 
     #[tokio::test]

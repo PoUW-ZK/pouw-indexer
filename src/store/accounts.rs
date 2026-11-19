@@ -20,8 +20,8 @@ impl Store {
                 .await?;
         rows.into_iter()
             .map(|(a, requested_at)| {
-                let address = a.try_into().map_err(|_| {
-                    StoreError::BadData("account_refresh.address is not 32 bytes".into())
+                let address = a.try_into().map_err(|_| StoreError::BadLength {
+                    column: "account_refresh.address",
                 })?;
                 Ok(Refresh {
                     address,

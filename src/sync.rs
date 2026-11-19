@@ -13,7 +13,7 @@
 //! are refreshed.
 
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use pouw_api::event::NodeId;
 use tracing::{error, info, warn};
@@ -21,7 +21,7 @@ use tracing::{error, info, warn};
 use crate::error::{StoreError, SyncError};
 use crate::metrics::Metrics;
 use crate::node::{MAX_BLOCKS_PER_CALL, NodeClient};
-use crate::store::{self, Checkpoint, Store};
+use crate::store::{self, Checkpoint, Hash, Store};
 
 pub struct SyncConfig {
     /// The followed node, the key of its row in `sync_state`.
@@ -40,8 +40,33 @@ pub enum Progress {
     Reorg { depth: u64 },
 }
 
-/// Addresses copied from the node per request round.
-const ACCOUNTS_PER_BATCH: u32 = 100;
+/// Addresses copied from the node per batch.
+const ACCOUNTS_PER_BATCH: u32 = 200;
+/// Batches copied in a round while blocks are still being written. The queue is in the
+/// database, so what is left waits, and the chain is never kept back by balances.
+const BATCHES_WHILE_BEHIND: usize = 1;
+/// Batches copied in a round when the chain is caught up.
+const BATCHES_WHEN_CAUGHT_UP: usize = 10;
+/// The statistics read the whole chain, so while blocks keep coming they are refreshed at
+/// most this often. A reorganisation refreshes them at once.
+pub const STATS_EVERY: Duration = Duration::from_secs(2);
+
+/// When the statistics were last refreshed, and whether the chain changed since.
+pub struct StatsClock {
+    every: Duration,
+    last: Instant,
+    dirty: bool,
+}
+
+impl StatsClock {
+    pub fn new(every: Duration) -> Self {
+        Self {
+            every,
+            last: Instant::now(),
+            dirty: false,
+        }
+    }
+}
 
 /// The node's chain no longer contains our checkpoint block. Find the newest height where
 /// our canonical block and the node's block are the same, orphan everything above it and
@@ -171,23 +196,23 @@ async fn advance<N: NodeClient>(
     })
 }
 
-/// Copy the queued addresses from the node. Each batch is read from the node first and written
-/// in one transaction, so no database transaction waits on the network.
+/// Copy the queued addresses from the node, at most `max_batches` batches. Each batch is read
+/// from the node first (many addresses at once) and written in one transaction, so no database
+/// transaction waits on the network. Addresses that are left stay in the queue.
 async fn copy_accounts<N: NodeClient>(
     store: &Store,
     node: &mut N,
     m: &Metrics,
+    max_batches: usize,
 ) -> Result<(), SyncError> {
-    loop {
+    for _ in 0..max_batches {
         let batch = store.accounts_to_refresh(ACCOUNTS_PER_BATCH).await?;
         if batch.is_empty() {
             return Ok(());
         }
         let node_height = node.head().await?.height;
-        let mut copied = Vec::with_capacity(batch.len());
-        for r in &batch {
-            copied.push(node.account(r.address).await?);
-        }
+        let addresses: Vec<Hash> = batch.iter().map(|r| r.address).collect();
+        let copied = node.accounts(&addresses).await?;
         let mut tx = store.begin().await?;
         for (r, account) in batch.iter().zip(copied) {
             match account {
@@ -202,6 +227,7 @@ async fn copy_accounts<N: NodeClient>(
         tx.commit().await.map_err(StoreError::from)?;
         m.accounts_copied.inc_by(batch.len() as u64);
     }
+    Ok(())
 }
 
 /// One round: advance the chain, then refresh what is derived from it.
@@ -210,12 +236,24 @@ pub async fn sync_step<N: NodeClient>(
     node: &mut N,
     cfg: &SyncConfig,
     m: &Metrics,
+    stats: &mut StatsClock,
 ) -> Result<Progress, SyncError> {
     let progress = advance(store, node, cfg, m).await?;
     if progress != Progress::CaughtUp {
-        store.refresh_stats().await?;
+        stats.dirty = true;
     }
-    copy_accounts(store, node, m).await?;
+    let reorg = matches!(progress, Progress::Reorg { .. });
+    if stats.dirty && (reorg || stats.last.elapsed() >= stats.every) {
+        store.refresh_stats().await?;
+        stats.dirty = false;
+        stats.last = Instant::now();
+    }
+    let batches = if progress == Progress::CaughtUp {
+        BATCHES_WHEN_CAUGHT_UP
+    } else {
+        BATCHES_WHILE_BEHIND
+    };
+    copy_accounts(store, node, m, batches).await?;
     Ok(progress)
 }
 
@@ -227,8 +265,10 @@ pub async fn sync_until_caught_up<N: NodeClient>(
     cfg: &SyncConfig,
     m: &Metrics,
 ) -> Result<(), SyncError> {
+    // refresh the statistics in every round, tests look at them right away
+    let mut stats = StatsClock::new(Duration::ZERO);
     for _ in 0..100_000 {
-        if sync_step(store, node, cfg, m).await? == Progress::CaughtUp {
+        if sync_step(store, node, cfg, m, &mut stats).await? == Progress::CaughtUp {
             return Ok(());
         }
     }
@@ -241,8 +281,9 @@ pub async fn sync_until_caught_up<N: NodeClient>(
 /// counted, logged and retried with a growing pause, so the HTTP server stays up.
 pub async fn run<N: NodeClient>(store: Store, mut node: N, cfg: SyncConfig, m: Arc<Metrics>) {
     let mut failures = 0u32;
+    let mut stats = StatsClock::new(STATS_EVERY);
     loop {
-        match sync_step(&store, &mut node, &cfg, &m).await {
+        match sync_step(&store, &mut node, &cfg, &m, &mut stats).await {
             Ok(Progress::CaughtUp) => {
                 failures = 0;
                 tokio::time::sleep(cfg.poll).await;
@@ -283,7 +324,7 @@ mod tests {
 
     use super::*;
     use crate::fakechain::{ChainBuilder, demo_chain};
-    use crate::node::MemoryNode;
+    use crate::node::{MemoryNode, share};
     use crate::store::Hash;
 
     fn cfg() -> SyncConfig {
@@ -349,7 +390,7 @@ mod tests {
         assert_eq!(count(&store, "SELECT count(*) FROM blocks").await, 7);
 
         // "restart": the node has more blocks now, and we sync again from the checkpoint
-        node.set_chain(chain.clone());
+        node.chain = share(chain.clone());
         sync_until_caught_up(&store, &mut node, &cfg(), &m)
             .await
             .unwrap();
@@ -382,7 +423,7 @@ mod tests {
         assert_eq!(canonical_hashes(&store).await, hashes(&a));
 
         // the node switches to branch b
-        node.set_chain(b.clone());
+        node.chain = share(b.clone());
         sync_until_caught_up(&store, &mut node, &cfg(), &m)
             .await
             .unwrap();
@@ -428,7 +469,7 @@ mod tests {
         );
 
         // and the node goes back to branch a: orphaned blocks become canonical again
-        node.set_chain(a.clone());
+        node.chain = share(a.clone());
         sync_until_caught_up(&store, &mut node, &cfg(), &m)
             .await
             .unwrap();
@@ -454,7 +495,7 @@ mod tests {
             .await
             .unwrap();
 
-        node.set_chain(a[..=12].to_vec());
+        node.chain = share(a[..=12].to_vec());
         sync_until_caught_up(&store, &mut node, &cfg(), &m)
             .await
             .unwrap();
@@ -497,7 +538,7 @@ mod tests {
         let mut expected: HashMap<Hash, (u64, u64)> = HashMap::new();
         for (i, addr) in addresses(&a).into_iter().enumerate() {
             expected.insert(addr, (1_000 + i as u64, i as u64));
-            node.set_account(addr, 1_000 + i as u64, i as u64);
+            node.balances.insert(addr, (1_000 + i as u64, i as u64));
         }
         let m = Metrics::new();
         sync_until_caught_up(&store, &mut node, &cfg(), &m)
@@ -529,10 +570,10 @@ mod tests {
         let dropped = addresses(&a[11..]);
         for addr in &dropped {
             let (balance, nonce) = expected[addr];
-            node.set_account(*addr, balance + 7, nonce + 1);
+            node.balances.insert(*addr, (balance + 7, nonce + 1));
             expected.insert(*addr, (balance + 7, nonce + 1));
         }
-        node.set_chain(b.clone());
+        node.chain = share(b.clone());
         sync_until_caught_up(&store, &mut node, &cfg(), &m)
             .await
             .unwrap();
@@ -578,11 +619,152 @@ mod tests {
         assert!((5.0..=15.0).contains(&avg), "average block time {avg}");
 
         // after a reorganisation only the canonical chain counts
-        node.set_chain(b.clone());
+        node.chain = share(b.clone());
         sync_until_caught_up(&store, &mut node, &cfg(), &m)
             .await
             .unwrap();
         let row: (i64, i64, i64) = sqlx::query_as(sums).fetch_one(store.pool()).await.unwrap();
         assert_eq!(row, totals(&b));
+    }
+
+    /// Three branches that share blocks 0..=7, as three miners make them when they find a block
+    /// at the same time: 13, 14 and 15 blocks long.
+    fn three_branches() -> Vec<Vec<BlockView>> {
+        let mut builder = ChainBuilder::new(9);
+        let common = builder.take(8);
+        (1..=3u64)
+            .map(|salt| {
+                let mut rival = builder.reseeded(salt);
+                let mut chain = common.clone();
+                chain.extend(rival.take(4 + salt as usize));
+                chain
+            })
+            .collect()
+    }
+
+    #[sqlx::test]
+    async fn three_miners_flip_the_chain_back_and_forth(pool: sqlx::PgPool) {
+        let store = Store::new(pool);
+        let branches = three_branches();
+        let mut node = MemoryNode::new(branches[0].clone());
+        let m = Metrics::new();
+        for (round, &i) in [0usize, 1, 2, 1, 0, 2, 0].iter().enumerate() {
+            node.chain = share(branches[i].clone());
+            sync_until_caught_up(&store, &mut node, &cfg(), &m)
+                .await
+                .unwrap();
+            let chain = &branches[i];
+            assert_eq!(
+                canonical_hashes(&store).await,
+                hashes(chain),
+                "round {round}: the database follows the node"
+            );
+            let twice = "SELECT count(*) FROM (SELECT height FROM blocks WHERE canonical \
+                         GROUP BY height HAVING count(*) > 1) d";
+            assert_eq!(
+                count(&store, twice).await,
+                0,
+                "one canonical block per height"
+            );
+            // the statistics of the miners are those of the canonical chain
+            let shares = "SELECT coalesce(sum(blocks), 0)::bigint FROM api.miner_shares";
+            assert_eq!(
+                count(&store, shares).await,
+                chain.len() as i64,
+                "round {round}"
+            );
+            let tip = "SELECT indexed_height FROM api.stats";
+            assert_eq!(
+                count(&store, tip).await,
+                chain.len() as i64 - 1,
+                "round {round}"
+            );
+        }
+        // every block that was ever canonical is still there: 8 shared and 5 + 6 + 7 own
+        assert_eq!(
+            count(&store, "SELECT count(*) FROM blocks").await,
+            8 + 5 + 6 + 7
+        );
+    }
+
+    /// Blocks with hundreds of transfers: all rows are written, the block counters and the
+    /// numbers of network_stats add up, and every address is copied from the node.
+    #[sqlx::test]
+    async fn busy_blocks_are_written_and_the_load_numbers_add_up(pool: sqlx::PgPool) {
+        let store = Store::new(pool);
+        let mut builder = ChainBuilder::new(3);
+        let mut chain = builder.take(2); // the genesis and the block that registers the circuits
+        for _ in 0..20 {
+            chain.push(builder.next_busy(300));
+        }
+        let mut node = MemoryNode::new(chain.clone());
+        for addr in addresses(&chain) {
+            node.balances.insert(addr, (1_000, 1));
+        }
+        let m = Metrics::new();
+        sync_until_caught_up(&store, &mut node, &cfg(), &m)
+            .await
+            .unwrap();
+
+        let entries = || {
+            chain
+                .iter()
+                .flat_map(|b| b.txs.iter().chain(b.proof_txs.iter().map(|p| &p.request)))
+        };
+        let transfers = chain
+            .iter()
+            .flat_map(|b| &b.txs)
+            .filter(|t| matches!(t.tx.body.kind, TxKind::Transfer { .. }))
+            .count() as i64;
+        let fees: u64 = entries().map(|t| t.tx.body.fee.0).sum();
+        assert!(transfers >= 20 * 300);
+
+        assert_eq!(
+            count(&store, "SELECT count(*) FROM transfers").await,
+            transfers
+        );
+        assert_eq!(
+            count(&store, "SELECT sum(transfer_count)::bigint FROM blocks").await,
+            transfers
+        );
+        assert_eq!(
+            count(&store, "SELECT sum(fee_total)::bigint FROM api.blocks").await,
+            fees as i64
+        );
+        assert_eq!(
+            count(&store, "SELECT sum(transfers)::bigint FROM network_stats").await,
+            transfers
+        );
+        assert_eq!(
+            count(&store, "SELECT sum(fees)::bigint FROM network_stats").await,
+            fees as i64
+        );
+        let off = "SELECT count(*) FROM network_stats WHERE abs(transfers_per_s - transfers / 60.0) > 1e-9";
+        assert_eq!(
+            count(&store, off).await,
+            0,
+            "transfers per second = transfers / 60"
+        );
+        let proofs: i64 = chain.iter().map(|b| b.proof_txs.len() as i64).sum();
+        assert_eq!(
+            count(&store, "SELECT sum(proof_count)::bigint FROM blocks").await,
+            proofs
+        );
+        // the work of the proofs: what the old view of 0008 computed, now read from the blocks
+        let work = "SELECT coalesce(sum(ci.constraint_count), 0)::bigint FROM proof_txs p \
+                    JOIN circuits ci ON ci.circuit_id = p.circuit_id";
+        assert_eq!(
+            count(&store, "SELECT sum(useful_work)::bigint FROM network_stats").await,
+            count(&store, work).await
+        );
+
+        assert_eq!(
+            count(&store, "SELECT count(*) FROM accounts").await as usize,
+            addresses(&chain).len()
+        );
+        assert_eq!(
+            count(&store, "SELECT count(*) FROM account_refresh").await,
+            0
+        );
     }
 }

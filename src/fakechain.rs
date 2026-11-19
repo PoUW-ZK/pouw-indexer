@@ -246,6 +246,23 @@ impl ChainBuilder {
         self.assemble(miner, Vec::new(), None)
     }
 
+    /// A block full of transfers, like the load generator makes: `n` of them and usually one
+    /// proved request. The circuits are registered by the first block after the genesis, so
+    /// until that one exists this gives an ordinary block.
+    #[allow(dead_code)] // used by the tests
+    pub fn next_busy(&mut self, n: usize) -> BlockView {
+        if self.circuits.is_empty() {
+            return self.next();
+        }
+        let miner = key(MINERS[self.below(2) as usize]).address();
+        let mut txs = Vec::with_capacity(n);
+        for _ in 0..n {
+            txs.push(self.transfer());
+        }
+        let proof = (self.below(10) < 7).then(|| self.proof_tx(miner));
+        self.assemble(miner, txs, proof)
+    }
+
     pub fn take(&mut self, n: usize) -> Vec<BlockView> {
         (0..n).map(|_| self.next()).collect()
     }

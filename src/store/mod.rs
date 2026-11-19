@@ -65,11 +65,9 @@ impl Store {
 }
 
 pub(crate) fn num(v: u64) -> Result<i64, StoreError> {
-    i64::try_from(v)
-        .map_err(|_| StoreError::BadData(format!("{v} does not fit in a Postgres BIGINT")))
+    i64::try_from(v).map_err(|_| StoreError::NotBigint { value: v })
 }
 
 pub(crate) fn unsigned(v: i64) -> Result<u64, StoreError> {
-    u64::try_from(v)
-        .map_err(|_| StoreError::BadData(format!("{v} is negative where a count was expected")))
+    u64::try_from(v).map_err(|_| StoreError::Negative { value: v })
 }
